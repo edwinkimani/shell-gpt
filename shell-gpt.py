@@ -171,6 +171,8 @@ class ToolManager:
         "traceroute": ["tracepath"],
         "tracepath": ["traceroute"],
         "vim": ["vi", "nano"],
+        "theharvester": ["theHarvester"],
+        "theharvester.py": ["theHarvester"],
     }
     
     def __init__(self, auto_install: bool = True):
@@ -363,6 +365,7 @@ class GroqClient:
                 time.sleep(wait + 0.3)
 
             try:
+                console.print(f"[dim]→ Contacting Groq with key #{idx} ({self.model})...[/dim]")
                 response = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={
@@ -380,6 +383,7 @@ class GroqClient:
 
                 if response.status_code == 200:
                     self.tracker.record_success(idx)
+                    console.print(f"[dim]✓ Groq replied with key #{idx}[/dim]")
                     return response.json()["choices"][0]["message"]["content"]
 
                 elif response.status_code == 429:
@@ -470,6 +474,8 @@ class CommandExecutor:
             
             # Monitor process with timeout
             start_time = time.time()
+            last_activity = start_time
+            last_heartbeat = start_time
             stdout_lines = []
             stderr_lines = []
             
@@ -502,14 +508,23 @@ class CommandExecutor:
                         line, is_stderr = stdout_queue.get_nowait()
                         if is_stderr:
                             stderr_lines.append(line)
+                            last_activity = time.time()
                             if show_live:
                                 console.print(f"[red]{line.rstrip()}[/red]")
                         else:
                             stdout_lines.append(line)
+                            last_activity = time.time()
                             if show_live:
                                 console.print(f"{line.rstrip()}")
                 except queue.Empty:
                     pass
+
+                now = time.time()
+                if show_live and now - last_heartbeat >= 15 and now - last_activity >= 15:
+                    elapsed = int(now - start_time)
+                    quiet_for = int(now - last_activity)
+                    console.print(f"[dim]... still running ({elapsed}s elapsed, no output for {quiet_for}s)[/dim]")
+                    last_heartbeat = now
                 
                 time.sleep(0.1)
             
@@ -1207,10 +1222,11 @@ def decide_single_action(raw: str, client: GroqClient, history: List[Dict]) -> b
         f"User request: {raw}"
     )
 
-    reply = client.chat([
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": decision_prompt},
-    ])
+    with console.status("[cyan]🤖 Asking Groq for the best single action...[/cyan]"):
+        reply = client.chat([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": decision_prompt},
+        ])
     if not reply:
         return False
 
@@ -1397,9 +1413,8 @@ def main():
         else:
             if maybe_execute_natural_language(raw, client, history):
                 continue
-            with console.status("[cyan]🤖 Deciding the best single action...[/cyan]"):
-                if decide_single_action(raw, client, history):
-                    continue
+            if decide_single_action(raw, client, history):
+                continue
             history.append({"role": "user", "content": raw})
             with console.status("[cyan]🤖 Thinking...[/cyan]"):
                 reply = client.chat([{"role": "system", "content": SYSTEM_PROMPT}] + history)
