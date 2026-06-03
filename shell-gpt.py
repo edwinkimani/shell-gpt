@@ -606,6 +606,51 @@ def replace_command_tool(command: str, old_tool: str, new_tool: str) -> str:
     pattern = re.compile(rf"(^|\s)({re.escape(old_tool)})(?=\s|$)")
     return pattern.sub(lambda m: f"{m.group(1)}{new_tool}", command, count=1)
 
+def command_parts(command: str) -> List[str]:
+    """Split a command safely enough to compare the executable and arguments."""
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+def same_task_executable_fix(original: str, corrected: str) -> bool:
+    """Allow only narrow fixes that replace the executable and keep the same arguments."""
+    original_parts = command_parts(original)
+    corrected_parts = command_parts(corrected)
+    if len(original_parts) != len(corrected_parts) or len(original_parts) < 1:
+        return False
+    if original_parts[1:] != corrected_parts[1:]:
+        return False
+    return Path(original_parts[0]).name != Path(corrected_parts[0]).name
+
+def detect_command_correction(command: str, stdout: str, stderr: str, code: int, tool_manager: ToolManager) -> Optional[Tuple[str, str]]:
+    """Detect a safe same-task correction from command errors or tool output."""
+    tool = extract_tool_from_command(command)
+    if not tool:
+        return None
+
+    combined = f"{stdout}\n{stderr}".strip()
+    if not combined:
+        return None
+
+    candidates: List[Tuple[str, str]] = []
+
+    if re.search(r"\bdeprecated\b", combined, re.IGNORECASE):
+        for match in re.finditer(r"use\s+([A-Za-z0-9_.@+-]+)", combined, re.IGNORECASE):
+            candidates.append((match.group(1), "tool output reported a deprecated command name"))
+
+    if code == 127 or re.search(r"command not found|not recognized|not installed", combined, re.IGNORECASE):
+        alternative = tool_manager.find_alternative_tool(tool)
+        if alternative:
+            candidates.append((alternative, "the original command was not found and an installed alternative exists"))
+
+    for new_tool, reason in candidates:
+        corrected = replace_command_tool(command, tool, new_tool)
+        if corrected != command and same_task_executable_fix(command, corrected):
+            return corrected, reason
+
+    return None
+
 def run_tool_with_check(command: str, tool_manager: ToolManager, timeout: int = 1800, show_live: bool = True, auto_install: bool = True) -> Tuple[str, str, int]:
     """Run a command, automatically installing missing tools if needed."""
     tool = extract_tool_from_command(command)
@@ -672,6 +717,35 @@ def run_and_analyze(command: str, client: GroqClient, history: List[Dict], analy
     # Execute with auto-install check
     timeout = cfg.get("command_timeout", 1800)
     stdout, stderr, code = run_tool_with_check(command, client.tool_manager, timeout=timeout, show_live=show_live, auto_install=cfg.get("auto_install_tools", True))
+    executed_command = command
+    correction_note = ""
+
+    correction = detect_command_correction(command, stdout, stderr, code, client.tool_manager)
+    if correction:
+        corrected_command, reason = correction
+        console.print(Panel(
+            f"[yellow]Detected command issue:[/yellow] {reason}\n\n"
+            f"Original:\n[dim]{command}[/dim]\n\n"
+            f"Corrected:\n[bold cyan]{corrected_command}[/bold cyan]\n\n"
+            "This is a same-task executable correction, so I will run it once.",
+            border_style="yellow",
+            title="Auto-Correction"
+        ))
+        stdout, stderr, code = run_tool_with_check(
+            corrected_command,
+            client.tool_manager,
+            timeout=timeout,
+            show_live=show_live,
+            auto_install=cfg.get("auto_install_tools", True),
+        )
+        executed_command = corrected_command
+        correction_note = f"\n\nCorrection applied: `{command}` was corrected to `{corrected_command}` because {reason}."
+    elif code != 0:
+        console.print(Panel(
+            "No safe same-task correction was detected. I will stop here and analyze the error instead of guessing a new command.",
+            border_style="red",
+            title="Correction Out Of Scope"
+        ))
     
     # Build combined output for analysis
     output_parts = []
@@ -704,8 +778,8 @@ def run_and_analyze(command: str, client: GroqClient, history: List[Dict], analy
         context = ""
     
     msg = (
-        f"I ran this command on Kali Linux:\n```bash\n{command}\n```\n"
-        f"Exit code: {code}\n\nOutput:\n```\n{truncated}\n```{context}\n\n"
+        f"I ran this command on Kali Linux:\n```bash\n{executed_command}\n```\n"
+        f"Exit code: {code}{correction_note}\n\nOutput:\n```\n{truncated}\n```{context}\n\n"
         "Please analyze this output thoroughly. Provide a short summary, key findings, and one suggested next action."
         "If the command failed (exit code 127), explain whether an alternative tool, installation, or discovery command is the best next move."
     )
